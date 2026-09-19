@@ -31,6 +31,10 @@ class IDManager:
         self._id += 1
         return self._id
 
+    def reserve_ids_up_to(self, last_used_id: int) -> None:
+        """No id lower than or equal to last_used_id will be handed out."""
+        self._id = max(self._id, last_used_id)
+
 
 class Result:
     """
@@ -87,6 +91,21 @@ class Result:
         with open(xml_file_path, "rb") as report_xml_file:
             xml_text = report_xml_file.read()
             self._report_results = result.CheckerResults.from_xml(xml_text)
+
+        # The ids handed out so far belong to the report that was just
+        # replaced, so the counter starts over for the loaded one.
+        self._id_manager = IDManager()
+
+        # The loaded report already uses some issue ids. Handing them out
+        # again would create duplicates that the issue lookup cannot tell
+        # apart, silently attaching locations to the wrong issue. Issues that
+        # reach a checker in any other way than load_from_file() and
+        # register_issue(), e.g. appended to the list returned by
+        # get_issues(), are not accounted for.
+        for bundle in self._report_results.checker_bundles:
+            for checker in bundle.checkers:
+                for issue in checker.issues:
+                    self._id_manager.reserve_ids_up_to(issue.issue_id)
 
     def write_to_file(self, xml_output_file_path: str, generate_summary=False) -> None:
         """

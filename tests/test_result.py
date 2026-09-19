@@ -1803,3 +1803,95 @@ def test_file_location_validation() -> None:
         "FileLocationType requires at least one of the attributes: column, row, or offset"
         in str(exc_info.value)
     )
+
+
+def test_register_issue_does_not_reuse_ids_of_a_loaded_report(tmp_path) -> None:
+    """Ids already used by a loaded report must not be handed out again.
+
+    register_issue() takes its ids from a counter that starts over for every
+    Result. Reusing an id of the loaded report would put two issues with the
+    same id in the same checker, and the lookup could not tell them apart.
+    """
+    report = Result()
+    report.load_from_file(EXTENDED_DEMO_REPORT_PATH)
+
+    loaded_ids = [
+        issue.issue_id
+        for bundle in report._report_results.checker_bundles
+        for checker in bundle.checkers
+        for issue in checker.issues
+    ]
+    assert 0 in loaded_ids
+
+    issue_id = report.register_issue(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        description="Newly registered issue",
+        level=IssueSeverity.ERROR,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+    assert issue_id == max(loaded_ids) + 1
+
+    # The loaded issue is still reachable under its own id.
+    report.add_file_location(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        issue_id=0,
+        row=1,
+        column=1,
+        description="Location for the loaded issue",
+    )
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+
+    written_report = Result()
+    written_report.load_from_file(output_path)
+    assert written_report.get_issue_ids("DemoCheckerBundle", "exampleChecker") == [
+        0,
+        issue_id,
+    ]
+    written_issues = written_report.get_issues("DemoCheckerBundle", "exampleChecker")
+    assert (
+        written_issues[0].description == "This is an information from the demo usecase"
+    )
+    assert [location.description for location in written_issues[0].locations] == [
+        "Location for the loaded issue"
+    ]
+    assert written_issues[1].description == "Newly registered issue"
+
+
+def test_load_from_file_with_override_starts_ids_over() -> None:
+    """The ids handed out for a replaced report must not carry over.
+
+    Otherwise the ids of the newly loaded report would depend on what was
+    registered on the report that was discarded.
+    """
+    report = Result()
+    report.load_from_file(EXTENDED_DEMO_REPORT_PATH)
+    for _ in range(3):
+        report.register_issue(
+            checker_bundle_name="DemoCheckerBundle",
+            checker_id="exampleChecker",
+            description="Issue on the report about to be discarded",
+            level=IssueSeverity.ERROR,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+
+    report.load_from_file(DEMO_REPORT_PATH, override=True)
+
+    loaded_ids = [
+        issue.issue_id
+        for bundle in report.get_checker_bundle_names()
+        for checker_id in report.get_checker_ids(bundle)
+        for issue in report.get_issues(bundle, checker_id)
+    ]
+    issue_id = report.register_issue(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        description="Issue on the newly loaded report",
+        level=IssueSeverity.ERROR,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    assert issue_id == max(loaded_ids) + 1

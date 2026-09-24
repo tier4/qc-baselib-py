@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Union, List, Set, Optional
 from lxml import etree
 from datetime import datetime
+from pydantic import ValidationError
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from qc_baselib import Configuration
 from .models import IssueSeverity, StatusType, result, common
@@ -88,16 +90,46 @@ class Result:
             xml_text = report_xml_file.read()
             self._report_results = result.CheckerResults.from_xml(xml_text)
 
-    def write_to_file(self, xml_output_file_path: str, generate_summary=False) -> None:
+    def write_to_file(
+        self, xml_output_file_path: str, generate_summary=False, validate=True
+    ) -> None:
         """
         generate_summary : bool
             Automatically generate a summary for each checker and checker bundle.
             The generated summary will be appended to the current summary.
+        validate : bool
+            Validate the relations between every checker and all of its issues
+            before writing. Disabling it writes the report as it is, e.g. to
+            inspect a report that is rejected by the validation.
+
+        Raises
+        ------
+        RuntimeError
+            If the report is empty.
+        pydantic.ValidationError
+            If a checker of the report violates the schema relations, which
+            can happen when the checker was modified without going through the
+            methods of this class, e.g. by appending to the list returned by
+            get_issues(). The error names the rejected checker and its bundle,
+            in its title and in the location of each error. No output file is
+            written in that case.
         """
         if self._report_results is None:
             raise RuntimeError(
                 "Report dump with empty report, the report needs to be loaded first"
             )
+
+        # Registering an issue only validates the issue being added against
+        # its checker, so the relations between every checker and all of its
+        # issues are checked once here. Note that this re-runs the validators
+        # of CheckerType only: already built nested models are not revalidated
+        # by pydantic, they were validated when they were created.
+        #
+        # It runs before the summary generation, which appends to the existing
+        # summaries, so that a rejected report is left untouched and can be
+        # written again after the caller fixed it.
+        if validate:
+            self._validate_checkers()
 
         if generate_summary:
             self._generate_checker_bundle_summary()
@@ -112,6 +144,45 @@ class Result:
                 skip_empty=True,
             )
             report_xml_file.write(xml_text)
+
+    def _validate_checkers(self) -> None:
+        for bundle in self._report_results.checker_bundles:
+            for checker in bundle.checkers:
+                try:
+                    result.CheckerType.model_validate(checker)
+                except ValidationError as error:
+                    # The error raised by pydantic does not tell which checker
+                    # was rejected, which matters here as every checker of the
+                    # report is validated at once. The checker is named in the
+                    # title, and in the location of each error so that it can
+                    # be read from errors() as well.
+                    raise ValidationError.from_exception_data(
+                        title=f"CheckerType (checker '{checker.checker_id}' of bundle '{bundle.name}')",
+                        line_errors=[
+                            self._locate_error(line_error, bundle, checker)
+                            for line_error in error.errors(include_url=False)
+                        ],
+                    ) from error
+
+    @staticmethod
+    def _locate_error(
+        line_error: dict, bundle: result.CheckerBundleType, checker: result.CheckerType
+    ) -> InitErrorDetails:
+        # from_exception_data() only accepts the error types known to pydantic
+        # by name. Wrapping the error as a custom one keeps its type name and
+        # its message as they are, for the custom errors a validator may raise
+        # as well as for the built-in ones.
+        return InitErrorDetails(
+            type=PydanticCustomError(line_error["type"], line_error["msg"]),
+            loc=(
+                "checker_bundles",
+                bundle.name,
+                "checkers",
+                checker.checker_id,
+                *line_error["loc"],
+            ),
+            input=line_error["input"],
+        )
 
     def write_markdown_doc(self, markdown_file_path: str) -> None:
         if self._report_results is None:
@@ -459,10 +530,21 @@ class Result:
         checker = self._get_checker(bundle=bundle, checker_id=checker_id)
 
         # Validation need to be triggered to check if no schema relation was
-        # violated by the new issue addition. It runs before the issue is
-        # added so that a rejected issue does not stay in the report.
+        # violated by the new issue addition. Only the issue being added is
+        # validated, otherwise the validation cost would grow quadratically
+        # with the number of registered issues. The relations between a
+        # checker and all of its issues are validated once in write_to_file().
+        #
+        # This is only equivalent to validating the complete issue list as long
+        # as every validator of CheckerType either inspects each issue on its
+        # own, or rejects any issue at all, as the skipped status check does.
+        # test_checker_validators_are_accounted_for fails when a validator is
+        # added, so that it gets classified here.
+        #
+        # It runs before the issue is added so that a rejected issue does not
+        # stay in the report.
         result.CheckerType.model_validate(
-            checker.model_copy(update={"issues": checker.issues + [issue]})
+            checker.model_copy(update={"issues": [issue]})
         )
 
         checker.issues.append(issue)

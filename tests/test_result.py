@@ -7,7 +7,8 @@
 import os
 import pytest
 from lxml import etree
-from pydantic_core import ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
+from pydantic_core import PydanticCustomError
 from datetime import datetime
 from qc_baselib.models import result
 from qc_baselib import Result, IssueSeverity, StatusType, Configuration
@@ -1945,3 +1946,133 @@ def test_report_is_still_usable_after_a_rejected_issue(tmp_path) -> None:
     assert [location.description for location in written_issues[0].locations] == [
         "Location for the valid issue"
     ]
+
+
+def _register_rejected_checker(report: Result) -> None:
+    _register_bundle_with_checker(report)
+
+    # Corrupt the report directly, bypassing register_issue().
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    checker.issues.append(
+        result.IssueType(
+            issue_id=0,
+            description="Issue with an unregistered rule uid",
+            level=IssueSeverity.INFORMATION,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+    )
+
+
+def test_write_to_file_validates_before_generating_summary(tmp_path) -> None:
+    """The report level validation must run before the summaries are generated.
+
+    The generated summaries are appended to the existing ones, so generating
+    them before a validation that can fail would grow the summaries on every
+    rejected write.
+    """
+    report = Result()
+    _register_rejected_checker(report)
+    checker = report._report_results.checker_bundles[0].checkers[0]
+
+    output_path = str(tmp_path / "result.xqar")
+
+    for _ in range(3):
+        with pytest.raises(ValidationError):
+            report.write_to_file(output_path, generate_summary=True)
+
+        assert not os.path.exists(output_path)
+        assert report._report_results.checker_bundles[0].summary == ""
+        assert checker.summary == ""
+
+
+def test_checker_validators_are_accounted_for() -> None:
+    """register_issue() only validates the issue being added.
+
+    That is equivalent to validating the complete issue list only for the
+    validators that inspect each issue on its own, or reject any issue at all.
+    A validator reasoning over the whole issue list, e.g. one requiring unique
+    issue ids, would silently stop being enforced at registration, and a field
+    validator would not run at all: write_to_file() validates the checker
+    instances, which re-runs the model validators only. When this fails,
+    classify the new validator in register_issue() before updating the sets
+    below.
+    """
+    decorators = result.CheckerType.__pydantic_decorators__
+    assert set(decorators.model_validators) == {
+        # Inspects each issue on its own.
+        "check_issue_ruleUID_matches_addressed_rules",
+        # Rejects any issue on a skipped checker, so a single one is enough.
+        "check_skipped_status_containing_issues",
+    }
+    assert set(decorators.field_validators) == set()
+
+
+def test_write_to_file_error_names_the_rejected_checker(tmp_path) -> None:
+    """Every checker is validated at once, so the error must tell which one."""
+    report = Result()
+    _register_rejected_checker(report)
+
+    with pytest.raises(ValidationError) as exc_info:
+        report.write_to_file(str(tmp_path / "result.xqar"))
+
+    assert "checker 'TestChecker' of bundle 'TestBundle'" in str(exc_info.value)
+    assert "does not match addressed rules UIDs" in str(exc_info.value)
+
+    # The checker is readable from the error details too, not only from the
+    # text of the exception.
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "value_error"
+    assert errors[0]["loc"] == (
+        "checker_bundles",
+        "TestBundle",
+        "checkers",
+        "TestChecker",
+    )
+    assert "does not match addressed rules UIDs" in errors[0]["msg"]
+
+
+def test_write_to_file_error_keeps_a_custom_error_type(tmp_path, monkeypatch) -> None:
+    """A validator raising a PydanticCustomError must not break the write error.
+
+    ValidationError.from_exception_data() only knows the built-in error types
+    by name, so a custom error type has to be carried over as an instance.
+    """
+
+    class RejectingModel(BaseModel):
+        @model_validator(mode="after")
+        def reject(self):
+            raise PydanticCustomError(
+                "custom_rejection", "Rejected by a custom validator"
+            )
+
+    def validate_with_custom_error(checker):
+        RejectingModel()
+
+    # The validators of a model are collected when the class is created, so
+    # the validation entry point is replaced rather than a validator.
+    monkeypatch.setattr(
+        result.CheckerType, "model_validate", validate_with_custom_error
+    )
+
+    report = Result()
+    _register_rejected_checker(report)
+
+    with pytest.raises(ValidationError) as exc_info:
+        report.write_to_file(str(tmp_path / "result.xqar"))
+
+    errors = exc_info.value.errors()
+    assert [error["type"] for error in errors] == ["custom_rejection"]
+    assert errors[0]["msg"] == "Rejected by a custom validator"
+
+
+def test_write_to_file_without_validation(tmp_path) -> None:
+    """A report rejected by the validation can still be written to inspect it."""
+    report = Result()
+    _register_rejected_checker(report)
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path, validate=False)
+
+    with open(output_path, "rb") as report_file:
+        assert b"Issue with an unregistered rule uid" in report_file.read()

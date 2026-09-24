@@ -1853,3 +1853,210 @@ def test_register_issue_does_not_reuse_ids_of_a_loaded_report(tmp_path) -> None:
     output_path = str(tmp_path / "result.xqar")
     report.write_to_file(output_path)
     assert os.path.exists(output_path)
+
+
+DUPLICATED_ISSUE_ID_REPORT = """<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<CheckerResults version="1.0.0">
+  <CheckerBundle build_date="" description="" name="DemoCheckerBundle" summary="" version="">
+    <Checker checkerId="firstChecker" description="First checker" summary="">
+      <AddressedRule ruleUID="test.com:qc:1.0.0:qwerty.qwerty"/>
+      <Issue description="issue of the first checker" issueId="0" level="3" ruleUID="test.com:qc:1.0.0:qwerty.qwerty"/>
+    </Checker>
+    <Checker checkerId="secondChecker" description="Second checker" summary="">
+      <AddressedRule ruleUID="test.com:qc:1.0.0:qwerty.qwerty"/>
+      <Issue description="issue of the second checker" issueId="0" level="3" ruleUID="test.com:qc:1.0.0:qwerty.qwerty"/>
+    </Checker>
+  </CheckerBundle>
+</CheckerResults>
+"""
+
+
+def _register_bundle_with_checker(report: Result) -> None:
+    report.register_checker_bundle(
+        name="TestBundle",
+        build_date="2024-05-31",
+        description="Example checker bundle",
+        version="0.0.1",
+        summary="",
+    )
+    report.register_checker(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Test checker",
+        summary="",
+    )
+
+
+def test_issues_are_indexed_when_the_report_is_loaded() -> None:
+    """Loading a report indexes its issues, no lookup needed to trigger it.
+
+    Relying on the linear fallback to fill the index would make the first
+    lookup of every issue scan the whole checker, which is quadratic over a
+    report whose issues all get a location.
+    """
+    report = Result()
+    report.load_from_file(EXTENDED_DEMO_REPORT_PATH)
+
+    indexed_issues = [issue for _, issue in report._issue_index.values()]
+    loaded_issues = [
+        issue
+        for bundle in report._report_results.checker_bundles
+        for checker in bundle.checkers
+        for issue in checker.issues
+    ]
+
+    assert len(indexed_issues) == len(loaded_issues)
+    assert all(
+        any(indexed is loaded for indexed in indexed_issues) for loaded in loaded_issues
+    )
+
+
+def test_add_location_to_issue_added_out_of_band() -> None:
+    """The lookup falls back to a linear scan for issues it has not indexed."""
+    report = Result()
+    _register_bundle_with_checker(report)
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    checker.issues.append(
+        result.IssueType(
+            issue_id=7,
+            description="Issue added out of band",
+            level=IssueSeverity.ERROR,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+    )
+    assert report._issue_index == {}
+
+    report.add_file_location(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        issue_id=7,
+        row=1,
+        column=1,
+        description="Location for the out of band issue",
+    )
+
+    assert [location.description for location in checker.issues[0].locations] == [
+        "Location for the out of band issue",
+    ]
+    # The scan result is indexed, so it is not repeated on the next lookup.
+    assert report._issue_index[(id(checker), 7)][1] is checker.issues[0]
+
+
+def test_add_location_to_issue_loaded_from_file(tmp_path) -> None:
+    """Issues loaded from a file are not registered through register_issue()."""
+    report = Result()
+    report.load_from_file(DEMO_REPORT_PATH)
+
+    report.add_file_location(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        issue_id=0,
+        row=1,
+        column=1,
+        description="Location added after loading",
+    )
+
+    issue = report._report_results.checker_bundles[0].checkers[0].issues[0]
+    assert len(issue.locations) == 1
+    assert issue.locations[0].description == "Location added after loading"
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+    assert os.path.exists(output_path)
+
+
+def test_issue_lookup_is_not_confused_by_duplicated_issue_ids(tmp_path) -> None:
+    """The same issue id can be reused by different checkers of a loaded report."""
+    report_path = tmp_path / "duplicated_issue_ids.xqar"
+    report_path.write_text(DUPLICATED_ISSUE_ID_REPORT, encoding="utf-8")
+
+    report = Result()
+    report.load_from_file(str(report_path))
+
+    # Alternate between both checkers to exercise repeated lookups of the same
+    # issue id against different checkers.
+    for checker_id in ["firstChecker", "secondChecker", "firstChecker"]:
+        report.add_file_location(
+            checker_bundle_name="DemoCheckerBundle",
+            checker_id=checker_id,
+            issue_id=0,
+            row=1,
+            column=1,
+            description="Location for " + checker_id,
+            coalesce=False,
+        )
+
+    # Both checkers must keep their own entry: an index keyed by issue id
+    # alone would have them evict each other on every lookup, falling back to
+    # the linear scan every time.
+    assert len(report._issue_index) == 2
+
+    checkers = report._report_results.checker_bundles[0].checkers
+    first_issue = checkers[0].issues[0]
+    second_issue = checkers[1].issues[0]
+
+    assert first_issue.description == "issue of the first checker"
+    assert second_issue.description == "issue of the second checker"
+    assert [location.description for location in first_issue.locations] == [
+        "Location for firstChecker",
+        "Location for firstChecker",
+    ]
+    assert [location.description for location in second_issue.locations] == [
+        "Location for secondChecker",
+    ]
+
+
+def test_load_from_file_with_override_resets_issue_lookup() -> None:
+    """The issues of a discarded report must not be kept by the lookup index."""
+    report = Result()
+    report.load_from_file(DEMO_REPORT_PATH)
+
+    report.add_file_location(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        issue_id=0,
+        row=1,
+        column=1,
+        description="Location on the first loaded report",
+    )
+    discarded_keys = set(report._issue_index)
+    assert discarded_keys != set()
+
+    report.load_from_file(EXTENDED_DEMO_REPORT_PATH, override=True)
+
+    # The index is rebuilt from the new report, so it holds exactly its
+    # issues and nothing of the discarded one.
+    loaded_issues = [
+        (checker, issue)
+        for bundle in report._report_results.checker_bundles
+        for checker in bundle.checkers
+        for issue in checker.issues
+    ]
+    assert set(report._issue_index) == {
+        (id(checker), issue.issue_id) for checker, issue in loaded_issues
+    }
+    assert all(
+        report._issue_index[(id(checker), issue.issue_id)][1] is issue
+        for checker, issue in loaded_issues
+    )
+
+    report.add_file_location(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        issue_id=0,
+        row=2,
+        column=2,
+        description="Location on the second loaded report",
+        coalesce=False,
+    )
+
+    issue = report._report_results.checker_bundles[0].checkers[0].issues[0]
+    assert [location.description for location in issue.locations] == [
+        "Location on the second loaded report",
+    ]

@@ -6,7 +6,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Union, List, Set, Optional
+from typing import Dict, Tuple, Union, List, Set, Optional
 from lxml import etree
 from datetime import datetime
 
@@ -81,6 +81,15 @@ class Result:
     ):
         self._report_results: Optional[result.CheckerResults] = None
         self._id_manager = IDManager()
+        # Index used to avoid a linear scan over the issues of a checker on
+        # every lookup. It is keyed by (id(checker), issue id) because a
+        # loaded report may reuse the same issue id in different checkers;
+        # keying by issue id alone would make those checkers evict each
+        # other's entries. The checker is kept in the value so that it stays
+        # alive and its id() cannot be reused by another object.
+        self._issue_index: Dict[
+            Tuple[int, int], Tuple[result.CheckerType, result.IssueType]
+        ] = {}
 
     def load_from_file(self, xml_file_path: str, override: bool = False) -> None:
         if self._report_results is not None and not override:
@@ -92,13 +101,27 @@ class Result:
             xml_text = report_xml_file.read()
             self._report_results = result.CheckerResults.from_xml(xml_text)
 
-        # The loaded report already uses some issue ids. Handing them out
-        # again would create duplicates that the issue lookup cannot tell
-        # apart, silently attaching locations to the wrong issue.
+        # The previously indexed issues do not belong to the report anymore.
+        self._issue_index.clear()
+
         for bundle in self._report_results.checker_bundles:
             for checker in bundle.checkers:
                 for issue in checker.issues:
+                    # The loaded report already uses some issue ids. Handing
+                    # them out again would create duplicates that the issue
+                    # lookup cannot tell apart, silently attaching locations
+                    # to the wrong issue.
                     self._id_manager.reserve_ids_up_to(issue.issue_id)
+
+                    # Indexing the loaded issues here keeps the lookup linear
+                    # for them too. Without it every issue of the report would
+                    # still be scanned for on its first lookup, which is
+                    # quadratic over a report whose issues all get a location.
+                    # setdefault keeps the first issue of a duplicated id, as
+                    # the linear fallback below does.
+                    self._issue_index.setdefault(
+                        (id(checker), issue.issue_id), (checker, issue)
+                    )
 
     def write_to_file(self, xml_output_file_path: str, generate_summary=False) -> None:
         """
@@ -318,6 +341,16 @@ class Result:
     def _get_issue(
         self, checker: result.CheckerType, issue_id: int
     ) -> result.IssueType:
+        index_key = (id(checker), issue_id)
+        indexed = self._issue_index.get(index_key)
+
+        if indexed is not None and indexed[0] is checker:
+            return indexed[1]
+
+        # Issues can reach a checker through neither register_issue() nor
+        # load_from_file(), e.g. when appended to the checker directly,
+        # therefore the linear lookup is kept as fallback. Its result is
+        # indexed to avoid scanning again.
         issue = next(
             (issue for issue in checker.issues if issue.issue_id == issue_id),
             None,
@@ -327,6 +360,8 @@ class Result:
             raise RuntimeError(
                 f"Issue not found. The specified {issue_id} does not exist on the report. Register the issue first."
             )
+
+        self._issue_index[index_key] = (checker, issue)
 
         return issue
 
@@ -466,6 +501,8 @@ class Result:
         # Validation need to be triggered to check if no schema relation was
         # violated by the new issue addition.
         result.CheckerType.model_validate(checker)
+
+        self._issue_index[(id(checker), issue_id)] = (checker, issue)
 
         return issue_id
 

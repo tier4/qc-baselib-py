@@ -1803,3 +1803,92 @@ def test_file_location_validation() -> None:
         "FileLocationType requires at least one of the attributes: column, row, or offset"
         in str(exc_info.value)
     )
+
+
+def _register_bundle_with_checker(report: Result) -> None:
+    report.register_checker_bundle(
+        name="TestBundle",
+        build_date="2024-05-31",
+        description="Example checker bundle",
+        version="0.0.1",
+        summary="",
+    )
+    report.register_checker(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Test checker",
+        summary="",
+    )
+
+
+def test_rejected_issue_is_not_kept_in_the_checker(tmp_path) -> None:
+    """A rejected issue must not stay in the report.
+
+    Otherwise it would be written to the output file although its
+    registration failed.
+    """
+    report = Result()
+    _register_bundle_with_checker(report)
+
+    with pytest.raises(ValidationError):
+        report.register_issue(
+            checker_bundle_name="TestBundle",
+            checker_id="TestChecker",
+            description="Issue with an unregistered rule uid",
+            level=IssueSeverity.INFORMATION,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    assert len(checker.issues) == 0
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+
+    assert os.path.exists(output_path)
+    with open(output_path, "rb") as report_file:
+        assert b"<Issue" not in report_file.read()
+
+
+def test_report_is_still_usable_after_a_rejected_issue(tmp_path) -> None:
+    """A rejected registration must not disturb the following ones."""
+    report = Result()
+    _register_bundle_with_checker(report)
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+    with pytest.raises(ValidationError):
+        report.register_issue(
+            checker_bundle_name="TestBundle",
+            checker_id="TestChecker",
+            description="Issue with an unregistered rule uid",
+            level=IssueSeverity.INFORMATION,
+            rule_uid="test.com:qc:1.0.0:unregistered.rule",
+        )
+
+    issue_id = report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Valid issue",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    report.add_file_location(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        issue_id=issue_id,
+        row=1,
+        column=1,
+        description="Location for the valid issue",
+    )
+
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    assert [issue.description for issue in checker.issues] == ["Valid issue"]
+    assert len(checker.issues[0].locations) == 1
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+    assert os.path.exists(output_path)

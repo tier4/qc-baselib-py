@@ -449,11 +449,14 @@ class Result:
 
         checker = self._get_checker(bundle=bundle, checker_id=checker_id)
 
-        checker.issues.append(issue)
-
         # Validation need to be triggered to check if no schema relation was
-        # violated by the new issue addition.
-        result.CheckerType.model_validate(checker)
+        # violated by the new issue addition. It runs before the issue is
+        # added so that a rejected issue does not stay in the report.
+        result.CheckerType.model_validate(
+            checker.model_copy(update={"issues": checker.issues + [issue]})
+        )
+
+        checker.issues.append(issue)
 
         return issue_id
 

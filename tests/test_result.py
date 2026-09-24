@@ -1892,3 +1892,122 @@ def test_report_is_still_usable_after_a_rejected_issue(tmp_path) -> None:
     output_path = str(tmp_path / "result.xqar")
     report.write_to_file(output_path)
     assert os.path.exists(output_path)
+
+
+def _register_rejected_checker(report: Result) -> None:
+    _register_bundle_with_checker(report)
+
+    # Corrupt the report directly, bypassing register_issue().
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    checker.issues.append(
+        result.IssueType(
+            issue_id=0,
+            description="Issue with an unregistered rule uid",
+            level=IssueSeverity.INFORMATION,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+    )
+
+
+def test_write_to_file_validates_before_generating_summary(tmp_path) -> None:
+    """The report level validation must run before the summaries are generated.
+
+    The generated summaries are appended to the existing ones, so generating
+    them before a validation that can fail would grow the summaries on every
+    rejected write.
+    """
+    report = Result()
+    _register_rejected_checker(report)
+    checker = report._report_results.checker_bundles[0].checkers[0]
+
+    output_path = str(tmp_path / "result.xqar")
+
+    for _ in range(3):
+        with pytest.raises(ValidationError):
+            report.write_to_file(output_path, generate_summary=True)
+
+        assert not os.path.exists(output_path)
+        assert report._report_results.checker_bundles[0].summary == ""
+        assert checker.summary == ""
+
+
+def test_skipped_checker_error_reports_the_real_issue_count() -> None:
+    """The skipped status error must count every issue of the checker.
+
+    register_issue() validates the checker against the issue being added
+    only, so the count has to be restored for this message.
+    """
+    report = Result()
+    _register_bundle_with_checker(report)
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    report.set_checker_status(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        status=StatusType.SKIPPED,
+    )
+
+    # A skipped checker holding issues cannot be built through the public API,
+    # so the issue is added directly to reach that state.
+    checker = report._report_results.checker_bundles[0].checkers[0]
+    checker.issues.append(
+        result.IssueType(
+            issue_id=0,
+            description="Issue added out of band",
+            level=IssueSeverity.ERROR,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+    )
+
+    with pytest.raises(ValidationError, match=r"Issues found: 2"):
+        report.register_issue(
+            checker_bundle_name="TestBundle",
+            checker_id="TestChecker",
+            description="Issue on a skipped checker",
+            level=IssueSeverity.ERROR,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+
+
+def test_checker_validators_are_accounted_for() -> None:
+    """register_issue() only validates the issue being added.
+
+    That is equivalent to validating the complete issue list only for the
+    validators that inspect each issue on its own. A validator reasoning over
+    the whole issue list would silently stop being enforced at registration.
+    When this fails, classify the new validator in register_issue() before
+    updating the set below.
+    """
+    assert set(result.CheckerType.__pydantic_decorators__.model_validators) == {
+        # Inspects each issue on its own.
+        "check_issue_ruleUID_matches_addressed_rules",
+        # Reasons over the whole issue list, handled by register_issue().
+        "check_skipped_status_containing_issues",
+    }
+
+
+def test_write_to_file_error_names_the_rejected_checker(tmp_path) -> None:
+    """Every checker is validated at once, so the error must tell which one."""
+    report = Result()
+    _register_rejected_checker(report)
+
+    with pytest.raises(ValidationError) as exc_info:
+        report.write_to_file(str(tmp_path / "result.xqar"))
+
+    assert "checker 'TestChecker' of bundle 'TestBundle'" in str(exc_info.value)
+    assert "does not match addressed rules UIDs" in str(exc_info.value)
+
+
+def test_write_to_file_without_validation(tmp_path) -> None:
+    """A report rejected by the validation can still be written to inspect it."""
+    report = Result()
+    _register_rejected_checker(report)
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path, validate=False)
+
+    with open(output_path, "rb") as report_file:
+        assert b"Issue with an unregistered rule uid" in report_file.read()

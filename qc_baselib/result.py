@@ -325,10 +325,7 @@ class Result:
     def _get_issue(
         self, checker: result.CheckerType, issue_id: int
     ) -> result.IssueType:
-        issue = next(
-            (issue for issue in checker.issues if issue.issue_id == issue_id),
-            None,
-        )
+        issue = checker.find_issue(issue_id)
 
         if issue is None:
             raise RuntimeError(

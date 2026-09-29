@@ -6,8 +6,8 @@
 import enum
 
 
-from typing import List, Any, Set, Optional
-from pydantic import model_validator
+from typing import Dict, List, Any, Set, Optional
+from pydantic import PrivateAttr, model_validator
 from pydantic_xml import BaseXmlModel, attr, element, computed_element
 from lxml import etree
 
@@ -230,6 +230,70 @@ class CheckerType(BaseXmlModel, validate_assignment=True, search_mode="unordered
     checker_id: str = attr(name="checkerId")
     description: str = attr(name="description")
     summary: str = attr(name="summary")
+
+    # Index used by find_issue(): the position in `issues` of the first issue
+    # with a given id, and how many leading entries of `issues` it covers. It
+    # is derived from `issues` and rebuilt whenever it is found out of date,
+    # so the list may still be modified directly. Note that model_copy()
+    # shares it with the copy; a lookup on either side may leave it out of
+    # date for the other, which the same verification catches.
+    _issue_positions: Dict[int, int] = PrivateAttr(default_factory=dict)
+    _indexed_issue_count: int = PrivateAttr(default=0)
+
+    def find_issue(self, issue_id: int) -> Optional[IssueType]:
+        """
+        Return the first issue with the given id, or None if there is none.
+
+        The lookup takes constant time on average, instead of scanning the
+        issues. With duplicated issue ids, the first of them is returned
+        unless the issues were modified directly, in which case any of them
+        may be.
+        """
+        issue = self._find_indexed_issue(issue_id)
+
+        if issue is None:
+            # Entries indexed before the issues were modified directly may
+            # hide an issue that is there, e.g. when an issue was replaced by
+            # one with a new id. Index the issues from scratch before giving
+            # up: this is the only way for a lookup to cost more than the
+            # issues appended since the last one.
+            self._issue_positions = {}
+            self._indexed_issue_count = 0
+            issue = self._find_indexed_issue(issue_id)
+
+        return issue
+
+    def _find_indexed_issue(self, issue_id: int) -> Optional[IssueType]:
+        issue = self._indexed_issue(issue_id)
+
+        if issue is None:
+            # Index the issues appended since the last lookup. Issues that were
+            # removed or moved in the meantime leave entries pointing at the
+            # wrong issue, which _indexed_issue() detects.
+            for position in range(self._indexed_issue_count, len(self.issues)):
+                self._issue_positions.setdefault(
+                    self.issues[position].issue_id, position
+                )
+            self._indexed_issue_count = len(self.issues)
+
+            issue = self._indexed_issue(issue_id)
+
+        return issue
+
+    def _indexed_issue(self, issue_id: int) -> Optional[IssueType]:
+        position = self._issue_positions.get(issue_id)
+
+        if position is None or position >= len(self.issues):
+            return None
+
+        issue = self.issues[position]
+
+        # The entry is only trusted if the issue it points at still has the
+        # id, which is not the case once the issues were modified directly.
+        if issue.issue_id != issue_id:
+            return None
+
+        return issue
 
     @model_validator(mode="after")
     def check_issue_ruleUID_matches_addressed_rules(self) -> Any:

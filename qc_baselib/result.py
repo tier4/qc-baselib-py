@@ -677,10 +677,23 @@ class Result:
     def set_checker_status(
         self, checker_bundle_name: str, checker_id: str, status: StatusType
     ) -> None:
+        """
+        Raises
+        ------
+        pydantic.ValidationError
+            If the status violates the schema relations of the checker, e.g.
+            the SKIPPED status on a checker holding issues. The checker is
+            left unchanged in that case.
+        """
         bundle = self._get_checker_bundle(checker_bundle_name=checker_bundle_name)
         checker = self._get_checker(bundle=bundle, checker_id=checker_id)
+
+        # The assignment below validates the checker, but the validators run
+        # once the new status is already stored, and a rejected status would
+        # stay on the checker. Validate a copy first so that it does not.
+        result.CheckerType.model_validate(checker.model_copy(update={"status": status}))
+
         checker.status = status
-        result.CheckerType.model_validate(checker)
 
     def get_result_version(self) -> str:
         return self._report_results.version

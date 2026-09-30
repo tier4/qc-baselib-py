@@ -4,6 +4,7 @@
 # Public License, v. 2.0. If a copy of the MPL was not distributed
 # with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import copy
 import os
 import pytest
 from lxml import etree
@@ -1895,3 +1896,279 @@ def test_load_from_file_with_override_starts_ids_over() -> None:
         rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
     )
     assert issue_id == max(loaded_ids) + 1
+
+
+def _register_bundle_with_checker_and_rule(report: Result) -> None:
+    report.register_checker_bundle(
+        name="TestBundle",
+        build_date="2024-05-31",
+        description="Example checker bundle",
+        version="0.0.1",
+        summary="",
+    )
+    report.register_checker(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Test checker",
+        summary="",
+    )
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+
+def _issue(issue_id: int, description: str) -> result.IssueType:
+    return result.IssueType(
+        issue_id=issue_id,
+        description=description,
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+
+def _add_location(report: Result, issue_id: int, description: str) -> None:
+    report.add_file_location(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        issue_id=issue_id,
+        row=1,
+        column=1,
+        description=description,
+    )
+
+
+def test_add_location_to_issue_loaded_from_file(tmp_path) -> None:
+    """Issues loaded from a file are not registered through register_issue()."""
+    report = Result()
+    report.load_from_file(EXTENDED_DEMO_REPORT_PATH)
+
+    report.add_file_location(
+        checker_bundle_name="DemoCheckerBundle",
+        checker_id="exampleChecker",
+        issue_id=0,
+        row=1,
+        column=1,
+        description="Location added after loading",
+    )
+
+    issue = report.get_issues("DemoCheckerBundle", "exampleChecker")[0]
+    assert issue.issue_id == 0
+    assert [location.description for location in issue.locations] == [
+        "Location added after loading"
+    ]
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+
+    written_report = Result()
+    written_report.load_from_file(output_path)
+    written_issue = written_report.get_issues("DemoCheckerBundle", "exampleChecker")[0]
+    assert [location.description for location in written_issue.locations] == [
+        "Location added after loading"
+    ]
+
+
+def test_issue_lookup_is_not_confused_by_duplicated_issue_ids_across_checkers(
+    tmp_path,
+) -> None:
+    """The same issue id can be reused by different checkers of a loaded report."""
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    report.register_checker(
+        checker_bundle_name="TestBundle",
+        checker_id="SecondChecker",
+        description="Second checker",
+        summary="",
+    )
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="SecondChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    # Issue ids are unique per Result, so a report reusing one across
+    # checkers has to be built directly.
+    report.get_issues("TestBundle", "TestChecker").append(
+        _issue(7, "issue of the first checker")
+    )
+    report.get_issues("TestBundle", "SecondChecker").append(
+        _issue(7, "issue of the second checker")
+    )
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+
+    loaded_report = Result()
+    loaded_report.load_from_file(output_path)
+    loaded_report.add_file_location(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        issue_id=7,
+        row=1,
+        column=1,
+        description="location of the first checker",
+    )
+    loaded_report.add_file_location(
+        checker_bundle_name="TestBundle",
+        checker_id="SecondChecker",
+        issue_id=7,
+        row=1,
+        column=1,
+        description="location of the second checker",
+    )
+
+    first_issue = loaded_report.get_issues("TestBundle", "TestChecker")[0]
+    second_issue = loaded_report.get_issues("TestBundle", "SecondChecker")[0]
+    assert first_issue.description == "issue of the first checker"
+    assert [location.description for location in first_issue.locations] == [
+        "location of the first checker"
+    ]
+    assert second_issue.description == "issue of the second checker"
+    assert [location.description for location in second_issue.locations] == [
+        "location of the second checker"
+    ]
+
+
+def test_issue_lookup_finds_an_issue_appended_directly() -> None:
+    """The issues of a checker may be modified without going through Result."""
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    issue_id = report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="registered issue",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    _add_location(report, issue_id, "location of the registered issue")
+
+    issues = report.get_issues("TestBundle", "TestChecker")
+    issues.append(_issue(42, "appended issue"))
+    _add_location(report, 42, "location of the appended issue")
+
+    assert [location.description for location in issues[1].locations] == [
+        "location of the appended issue"
+    ]
+
+
+def test_issue_lookup_after_an_issue_was_removed_directly() -> None:
+    """A removed issue must not be found, and the remaining ones still must be."""
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    issue_ids = [
+        report.register_issue(
+            checker_bundle_name="TestBundle",
+            checker_id="TestChecker",
+            description=f"issue {index}",
+            level=IssueSeverity.INFORMATION,
+            rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+        )
+        for index in range(3)
+    ]
+    for issue_id in issue_ids:
+        _add_location(report, issue_id, f"first location of issue {issue_id}")
+
+    issues = report.get_issues("TestBundle", "TestChecker")
+    removed_issue = issues.pop(1)
+
+    with pytest.raises(RuntimeError, match="Issue not found"):
+        _add_location(report, issue_ids[1], "location of the removed issue")
+    assert len(removed_issue.locations) == 1
+
+    _add_location(report, issue_ids[2], "second location of the last issue")
+    assert [location.description for location in issues[1].locations] == [
+        f"first location of issue {issue_ids[2]}",
+        "second location of the last issue",
+    ]
+
+
+def test_issue_lookup_after_an_issue_was_replaced_directly() -> None:
+    """An issue replaced by one with a new id must be found under the new id."""
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    issue_id = report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="original issue",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    _add_location(report, issue_id, "location of the original issue")
+
+    issues = report.get_issues("TestBundle", "TestChecker")
+    issues[0] = _issue(99, "replacement issue")
+
+    _add_location(report, 99, "location of the replacement issue")
+    with pytest.raises(RuntimeError, match="Issue not found"):
+        _add_location(report, issue_id, "location of the replaced issue")
+
+    assert [location.description for location in issues[0].locations] == [
+        "location of the replacement issue"
+    ]
+
+
+def test_issue_lookup_returns_the_first_of_duplicated_issue_ids() -> None:
+    """A report reusing an issue id inside a checker resolves to the first one.
+
+    Such reports were written by earlier versions of the library. The lookup
+    keeps returning the issue a scan of the list would return.
+    """
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    issues = report.get_issues("TestBundle", "TestChecker")
+    issues.append(_issue(0, "first issue with id 0"))
+    issues.append(_issue(0, "second issue with id 0"))
+
+    _add_location(report, 0, "location for id 0")
+
+    assert [location.description for location in issues[0].locations] == [
+        "location for id 0"
+    ]
+    assert issues[1].locations == []
+
+
+def test_issue_lookup_on_a_copied_report() -> None:
+    """A deep copy of a report looks its own issues up, not the original's."""
+    report = Result()
+    _register_bundle_with_checker_and_rule(report)
+    issue_id = report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="issue",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    _add_location(report, issue_id, "location added before the copy")
+
+    copied_report = copy.deepcopy(report)
+    _add_location(copied_report, issue_id, "location added to the copy")
+
+    original_issue = report.get_issues("TestBundle", "TestChecker")[0]
+    copied_issue = copied_report.get_issues("TestBundle", "TestChecker")[0]
+    assert copied_issue is not original_issue
+    assert [location.description for location in original_issue.locations] == [
+        "location added before the copy"
+    ]
+    assert [location.description for location in copied_issue.locations] == [
+        "location added before the copy",
+        "location added to the copy",
+    ]
+
+
+def test_find_issue_indexes_only_the_issues_appended_since_the_last_lookup() -> None:
+    """Looking a new issue up must not scan the whole list again.
+
+    This is what keeps registering an issue and adding a location to it, N
+    times in a row, linear in N.
+    """
+    checker = result.CheckerType(checker_id="C", description="", summary="")
+    for issue_id in range(3):
+        checker.issues.append(_issue(issue_id, f"issue {issue_id}"))
+        assert checker.find_issue(issue_id) is checker.issues[issue_id]
+        assert checker._indexed_issue_count == issue_id + 1
+
+    # A lookup of an id that is not there is the only one that indexes the
+    # whole list again, and it changes nothing when the index is up to date.
+    assert checker.find_issue(100) is None
+    assert checker._issue_positions == {0: 0, 1: 1, 2: 2}
+    assert checker._indexed_issue_count == 3

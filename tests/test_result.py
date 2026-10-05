@@ -2218,6 +2218,53 @@ def test_rejected_issue_is_not_kept_in_the_checker(tmp_path) -> None:
     assert written_report.get_issue_count() == 0
 
 
+def test_rejected_status_is_not_kept_on_the_checker(tmp_path) -> None:
+    """A rejected status must not stay on the checker.
+
+    Otherwise the checker would be written with that status, and every
+    later registration of an issue on it would fail.
+    """
+    report = Result()
+    _register_bundle_with_checker(report)
+    report.register_rule_by_uid(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+    report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Issue registered before the status change",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+    with pytest.raises(ValidationError):
+        report.set_checker_status(
+            checker_bundle_name="TestBundle",
+            checker_id="TestChecker",
+            status=StatusType.SKIPPED,
+        )
+
+    assert report.get_checker_status("TestChecker") is None
+
+    report.register_issue(
+        checker_bundle_name="TestBundle",
+        checker_id="TestChecker",
+        description="Issue registered after the rejected status",
+        level=IssueSeverity.INFORMATION,
+        rule_uid="test.com:qc:1.0.0:qwerty.qwerty",
+    )
+
+    output_path = str(tmp_path / "result.xqar")
+    report.write_to_file(output_path)
+
+    written_report = Result()
+    written_report.load_from_file(output_path)
+    assert written_report.get_checker_status("TestChecker") is None
+    assert written_report.get_checker_issue_count("TestBundle", "TestChecker") == 2
+
+
 def test_report_is_still_usable_after_a_rejected_issue(tmp_path) -> None:
     """A rejected registration must not disturb the following ones."""
     report = Result()

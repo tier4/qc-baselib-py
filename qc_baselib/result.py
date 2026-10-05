@@ -454,6 +454,15 @@ class Result:
         """
         Issue will be registered to checker and the generated issue id will be
         returned.
+
+        Raises
+        ------
+        pydantic.ValidationError
+            If the issue violates the schema relations of its checker, e.g. its
+            rule uid is not addressed by the checker. The checker is left
+            unchanged in that case: the rejected issue is neither kept in the
+            report nor written to the output file, and further issues can
+            still be registered on the checker.
         """
         issue_id = self._id_manager.get_next_free_id()
 
@@ -465,11 +474,14 @@ class Result:
 
         checker = self._get_checker(bundle=bundle, checker_id=checker_id)
 
-        checker.issues.append(issue)
-
         # Validation need to be triggered to check if no schema relation was
-        # violated by the new issue addition.
-        result.CheckerType.model_validate(checker)
+        # violated by the new issue addition. It runs before the issue is
+        # added so that a rejected issue does not stay in the report.
+        result.CheckerType.model_validate(
+            checker.model_copy(update={"issues": checker.issues + [issue]})
+        )
+
+        checker.issues.append(issue)
 
         return issue_id
 
